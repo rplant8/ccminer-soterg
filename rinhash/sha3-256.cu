@@ -111,7 +111,7 @@ __device__ void sha3_256_device(const uint8_t *input, size_t inlen, uint8_t *has
     uint64_t st[25] = {0};   // 内部状態（25ワード＝1600ビット）
 
     for (int i = 0; i < 25; i++) st[i] = 0;
-    size_t offset = 0;
+    // size_t offset = 0; // Unused variable removed
 
 
     // 通常ブロック（rateバイト）処理（今回inlen=32なのでスキップされるはず）

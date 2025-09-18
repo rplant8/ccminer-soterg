@@ -1851,12 +1851,12 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			equi_work_set_target(work, sctx->job.diff / opt_difficulty);
 			break;
 		case ALGO_RINHASH:
-			rinhash_work_set_target(work, sctx->job.diff / 0.95);
+			rinhash_work_set_target(work, sctx->job.diff / opt_difficulty);
 			break;
 		case ALGO_SHA3D:
-			rinhash_work_set_target(work, sctx->job.diff / opt_difficulty);
-		default:
 			work_set_target(work, sctx->job.diff / opt_difficulty);
+		default:
+			equi_work_set_target(work, sctx->job.diff / opt_difficulty);
 	}
 
 	if (stratum_diff != sctx->job.diff) {

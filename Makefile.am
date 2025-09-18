@@ -152,7 +152,7 @@ nvcc_ARCH += -gencode=arch=compute_52,code=\"sm_52,compute_52\"
 nvcc_ARCH += -gencode=arch=compute_50,code=\"sm_50,compute_50\"
 
 nvcc_FLAGS = $(nvcc_ARCH) @CUDA_INCLUDES@ -I. @CUDA_CFLAGS@
-nvcc_FLAGS += $(JANSSON_INCLUDES) --ptxas-options="-v"
+nvcc_FLAGS += $(JANSSON_INCLUDES) --ptxas-options="-v" --std=c++14
 
 # we're now targeting all major compute architectures within one binary.
 .cu.o:

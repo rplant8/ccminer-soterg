@@ -103,14 +103,14 @@ extern "C" __global__ void rinhash_cuda_kernel_optimized(
     // Check if hash meets target (little-endian comparison from back)
     bool meets_target = true;
     for (int i = 7; i >= 0; i--) {
-        uint32_t swapped_hash = ((hash_words[i] & 0xFF) << 24) | 
-                               ((hash_words[i] & 0xFF00) << 8) | 
-                               ((hash_words[i] & 0xFF0000) >> 8) | 
-                               ((hash_words[i] & 0xFF000000) >> 24);
-        if (swapped_hash > target[i]) {
+//        uint32_t* hash_words[i] = ((hash_words[i] & 0xFF) << 24) | 
+//                               ((hash_words[i] & 0xFF00) << 8) | 
+//                               ((hash_words[i] & 0xFF0000) >> 8) | 
+//                               ((hash_words[i] & 0xFF000000) >> 24);
+        if (hash_words[i] > target[i]) {
             meets_target = false;
             break;
-        } else if (swapped_hash < target[i]) {
+        } else if (hash_words[i] < target[i]) {
             break; // This hash is better, continue to set solution
         }
     }

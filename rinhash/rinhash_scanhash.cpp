@@ -1,6 +1,5 @@
 #include <stdio.h>
 #include <cstdint>
-#include <sys/time.h>
 
 #include <memory.h>
 
@@ -30,19 +29,6 @@ extern "C" void RinHash_mine(
     uint8_t* best_hash
 );
 
-// 🚀 NEW: Optimized mining function with target-aware early termination
-extern "C" void RinHash_mine_optimized(
-    const uint32_t* work_data,
-    uint32_t nonce_offset,
-    uint32_t start_nonce,
-    uint32_t num_nonces,
-    uint32_t* target,
-    uint32_t* found_nonce,
-    uint8_t* target_hash,
-    uint8_t* best_hash,
-    uint32_t* solution_found
-);
-
 // Thread-local variables
 thread_local uint32_t *d_hash = NULL;
 thread_local uint8_t *d_rinhash_out = NULL;
@@ -52,9 +38,6 @@ extern "C" void rinhash_init(int thr_id)
 {
     
 }
-
-// External reference to persistent memory cleanup
-extern "C" void rinhash_cuda_cleanup_persistent();
 
 // Cleanup function for RinHash algorithm
 extern "C" void rinhash_free(int thr_id)
@@ -67,9 +50,6 @@ extern "C" void rinhash_free(int thr_id)
 
     d_hash = NULL;
     d_rinhash_out = NULL;
-    
-    // Clean up persistent GPU memory
-    rinhash_cuda_cleanup_persistent();
 }
 
 // Main scanning function that tries different nonces to find a valid hash
@@ -80,44 +60,25 @@ int scanhash_rinhash(int thr_id, struct work *work, uint32_t max_nonce, unsigned
     const uint32_t first_nonce = pdata[19];
     uint32_t nonce = first_nonce;
     if (opt_benchmark)
-        ptarget[7] = 0x0000ff;
+        ptarget[7] = 0xff;
 
-    // 🚀 GTX 1060 3GB OPTIMIZED: Auto-detect GPU memory and set optimal batch size
-    size_t free_mem, total_mem;
-    cudaMemGetInfo(&free_mem, &total_mem);
-    
-    uint32_t batch_size;
-    if (total_mem <= 3ULL * 1024 * 1024 * 1024) { // <= 3GB VRAM
-        batch_size = 8192;  // 8K nonces for 3GB cards (GTX 1060 3GB)
-    } else if (total_mem <= 6ULL * 1024 * 1024 * 1024) { // <= 6GB VRAM  
-        batch_size = 16384; // 16K nonces for 6GB cards (GTX 1060 6GB)
-    } else { // 8GB+ VRAM
-        batch_size = 32768; // 32K nonces for high-end cards
-    }
-    
-    if (opt_debug) {
-        applog(LOG_INFO, "GPU Memory: %.1f GB, Using batch_size: %u", 
-               total_mem / (1024.0 * 1024.0 * 1024.0), batch_size);
-    }
+    // Set up batch mining parameters
+    uint32_t batch_size = 8192; // Number of nonces to try in each batch
     uint32_t found_nonce = 0;
     uint8_t best_hash[32];
     uint8_t target_hash[32];
 
     // Convert target to bytes
     for (int i = 0; i < 8; i++) {
-        uint32_t tmp = ptarget[7-i];
-        target_hash[i*4+0] = (tmp >> 24) & 0xff;
-        target_hash[i*4+1] = (tmp >> 16) & 0xff;
-        target_hash[i*4+2] = (tmp >> 8) & 0xff;
-        target_hash[i*4+3] = tmp & 0xff;
+        uint32_t tmp = ptarget[i];
+        target_hash[i*4+0] = tmp & 0xff;
+        target_hash[i*4+1] = (tmp >> 8) & 0xff;
+        target_hash[i*4+2] = (tmp >> 16) & 0xff;
+        target_hash[i*4+3] = (tmp >> 24) & 0xff;
     }
 
     work->valid_nonces = 0;
     cudaSetDevice(device_map[thr_id]);
-    
-    // Track start time for hashrate calculation
-    struct timeval tv_start, tv_end;
-    gettimeofday(&tv_start, NULL);
 
     do {
         uint32_t current_batch_size = min(batch_size, max_nonce - nonce);
@@ -127,43 +88,21 @@ int scanhash_rinhash(int thr_id, struct work *work, uint32_t max_nonce, unsigned
             return 0;
         }
 
-        // 🚀 OPTIMIZED: Use target-aware mining for early termination
-        uint32_t solution_found = 0;
-        uint32_t target_words[8];
-        
-        // Convert target to uint32_t array for GPU kernel
-        for (int i = 0; i < 8; i++) {
-            target_words[i] = ptarget[7-i]; // reverse order for proper comparison
-        }
-        
-        RinHash_mine_optimized(
+        // Mine a batch of nonces using raw work data
+        RinHash_mine(
             pdata,
             19, // nonce offset in work data
             nonce,
             current_batch_size,
-            target_words,
             &found_nonce,
             target_hash,
-            best_hash,
-            &solution_found
+            best_hash
         );
 
         *hashes_done = nonce - first_nonce + current_batch_size;
-        
-        // Update thread hashrate every batch
-        gettimeofday(&tv_end, NULL);
-        double elapsed = (tv_end.tv_sec - tv_start.tv_sec) + (tv_end.tv_usec - tv_start.tv_usec) / 1000000.0;
-        if (elapsed > 0.0) {
-                extern double thr_hashrates[];
-                extern pthread_mutex_t stats_lock;
-                
-                pthread_mutex_lock(&stats_lock);
-                thr_hashrates[thr_id] = (*hashes_done) / elapsed;
-                pthread_mutex_unlock(&stats_lock);
-        }
 
-        // 🚀 OPTIMIZED: Check if solution was found or improved hash
-        if (solution_found || found_nonce != nonce) {
+        // Check if we found a valid hash
+        if (found_nonce != nonce) {
             // Convert best_hash to vhash for verification
             uint32_t _ALIGN(64) vhash[8];
             for (int i = 0; i < 8; i++) {
@@ -177,20 +116,12 @@ int scanhash_rinhash(int thr_id, struct work *work, uint32_t max_nonce, unsigned
             const uint32_t Htarg = ptarget[7];
             if (vhash[7] <= Htarg && fulltest(vhash, ptarget)) {
                 work->valid_nonces = 1;
-                rinhash_set_target_ratio(work, vhash);  // Use RinHash-specific function
+                rinhash_set_target_ratio(work, vhash);
                 work->nonces[0] = found_nonce;
                 pdata[19] = found_nonce + 1;
-                
-                if (solution_found && opt_debug) {
-                    applog(LOG_INFO, "🚀 GPU Optimized Early Solution Found! Nonce: %08x", found_nonce);
-                }
-                
                 return 1;
             } else {
                 gpu_increment_reject(thr_id);
-                if (opt_debug && solution_found) {
-                    applog(LOG_WARNING, "GPU found potential solution but failed verification");
-                }
             }
         }
 

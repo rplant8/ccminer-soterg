@@ -720,6 +720,10 @@ static void calc_network_diff(struct work *work)
 		net_diff = equi_network_diff(work);
 		return;
 	}
+	// 🚨 RINHASH FIX: Handle RinHash network difficulty calculation
+//	if (opt_algo == ALGO_RINHASH) {
+//		nbits = swab32(work->data[18]); // Ensure correct endianness
+//	}
 
 	uint32_t bits = (nbits & 0xffffff);
 	int16_t shift = (swab32(nbits) & 0xff); // 0x1c = 28
@@ -1666,12 +1670,20 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			gostd(merkle_root, merkle_root, 64);
 		}
 #ifdef WITH_HEAVY_ALGO
-		if (opt_algo == ALGO_HEAVY || opt_algo == ALGO_MJOLLNIR)
-			heavycoin_hash(merkle_root, merkle_root, 64);
-		else
+                else if (opt_algo == ALGO_HEAVY || opt_algo == ALGO_MJOLLNIR)
+                        heavycoin_hash(merkle_root, merkle_root, 64);
 #endif
-			sha256d(merkle_root, merkle_root, 64);
-	}
+                // 🚨 RINHASH FIX START
+				else if (opt_algo == ALGO_RINHASH) {
+						// Đúng chuẩn RINHASH: Merkle tree phải dùng SHA256d, không dùng sha3d!
+						sha256d(merkle_root, merkle_root, 64);
+				}
+				// 🚨 RINHASH FIX END
+                else if (opt_algo == ALGO_SHA3D || opt_algo == ALGO_KECCAK || opt_algo == ALGO_FUGUE256 || opt_algo == ALGO_GROESTL)
+                        sha3d(merkle_root, merkle_root, 64);
+                else
+                        sha256d(merkle_root, merkle_root, 64);
+        }
 	
 	/* Increment extranonce2 */
 	for (i = 0; i < (int)sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
@@ -1708,7 +1720,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		work->data[0] = swab32(le32dec(sctx->job.version));
 		for (i = 0; i < 8; i++) // reversed prevhash
 			work->data[1 + i] = swab32(work->data[1 + i]);
-		memcpy(&work->data[9], merkle_root, 32);
+		memcpy(&work->data[9], merkle_root, 64);
 		work->data[ 17 ] = swab32(le32dec(sctx->job.ntime));
 		work->data[ 18 ] = swab32(le32dec(sctx->job.nbits));
 		work->data[ 19 ] = 0;
@@ -1839,12 +1851,12 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			equi_work_set_target(work, sctx->job.diff / opt_difficulty);
 			break;
 		case ALGO_RINHASH:
-			rinhash_work_set_target(work, sctx->job.diff);
+			rinhash_work_set_target(work, sctx->job.diff / 0.95);
 			break;
 		case ALGO_SHA3D:
 			rinhash_work_set_target(work, sctx->job.diff / opt_difficulty);
 		default:
-			rinhash_work_set_target(work, sctx->job.diff);
+			work_set_target(work, sctx->job.diff / opt_difficulty);
 	}
 
 	if (stratum_diff != sctx->job.diff) {
@@ -1852,7 +1864,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		// store for api stats
 		stratum_diff = sctx->job.diff;
 		if (opt_showdiff && work->targetdiff != stratum_diff)
-			snprintf(sdiff, 32, " (%.6f)", work->targetdiff);
+			snprintf(sdiff, 32, " (%.8f)", work->targetdiff);
 		applog(LOG_WARNING, "Stratum difficulty set to %g%s", stratum_diff, sdiff);
 	}
 

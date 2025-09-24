@@ -811,7 +811,7 @@ bool fulltest(const uint32_t *hash, const uint32_t *target)
     bool rc = true;
 
     // Sửa vòng for: so sánh từ MSB (i=0) đến LSB (i=7)
-    for (i = 0; i < 8; i++) {
+    for (i = 7; i >= 0; i--) {
         if (hash[i] > target[i]) {
             rc = false;
             break;
@@ -830,8 +830,8 @@ bool fulltest(const uint32_t *hash, const uint32_t *target)
         char *hash_str, *target_str;
 
         for (i = 0; i < 8; i++) {
-            le32enc(hash_be + i, hash[i]);
-            le32enc(target_be + i, target[i]);
+            be32enc(hash_be + i, hash[7 - i]);
+            be32enc(target_be + i, target[7 - i]);
         }
         hash_str = bin2hex((uchar *)hash_be, 32);
         target_str = bin2hex((uchar *)target_be, 32);
@@ -853,21 +853,17 @@ bool fulltest(const uint32_t *hash, const uint32_t *target)
 void diff_to_target(uint32_t *target, double diff)
 {
         uint64_t m;
-        int i;
+        int k;
 
-        for (i = 6; i > 0 && diff > 1.0; i--)
+        for (k = 6; k > 0 && diff > 1.0; k--)
                 diff /= 4294967296.0;
         m = (uint64_t)(4294901760.0 / diff);
-        if (m == 0 && i == 6)
+        if (m == 0 && k == 6)
                 memset(target, 0xff, 32);
         else {
                 memset(target, 0, 32);
-                target[i] = (uint32_t)(m >> 0);
-                target[i + 1] = (uint32_t)(m >> 8);
-                target[i + 2] = (uint32_t)(m >> 32);
-                memset(target, 0xff, 6*sizeof(uint32_t));
-                for (i = 0; i < 1 && ((uint8_t*)target)[i] == 0; i++)
-                        ((uint8_t*)target)[i] = 0xff;
+                target[k] = (uint32_t)m;
+                target[k + 1] = (uint32_t)(m >> 32);
         }
 }
 
@@ -891,7 +887,7 @@ void rinhash_set_target_ratio(struct work* work, uint32_t* hash) {
     work->shareratio[work->submit_nonce_id] = bn_hash_target_ratio(hash, work->target);
     
     // But calculate share difficulty using the adjustment factor
-    // Pool expects shares based on original difficulty, but our target is 16384x easier
+    // Pool expects shares based on original difficulty
     work->sharediff[work->submit_nonce_id] = work->targetdiff * work->shareratio[work->submit_nonce_id];
 }
 // Only used by longpoll pools
@@ -911,7 +907,7 @@ double target_to_diff(uint32_t* target)
         if (!m)
                 return 0.;
         else
-                return (double)0x00FFFFFFu/m;
+                return (double)0x0000ffff00000000/m;
 }
 
 double rinhash_to_diff(uint32_t* target)
@@ -930,7 +926,7 @@ double rinhash_to_diff(uint32_t* target)
         if (!m)
                 return 0.;
         else
-                return (double)0x00FFFFFFu/m;
+                return (double)0x0000ffff00000000/m;
 }
 
 #ifdef WIN32
@@ -1196,6 +1192,7 @@ void stratum_free_job(struct stratum_ctx *sctx)
                 free(sctx->job.merkle);
         }
         free(sctx->job.coinbase);
+        free(sctx->job.mweb_data);  // Clean up MWEB data
         // note: xnonce2 is not allocated
         memset(&(sctx->job.job_id), 0, sizeof(struct stratum_job));
         pthread_mutex_unlock(&stratum_work_lock);
@@ -1519,11 +1516,12 @@ static uint32_t getblocheight(struct stratum_ctx *sctx)
 static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 {
         const char *job_id, *prevhash, *coinb1, *coinb2, *version, *nbits, *stime;
-        const char *claim = NULL, *nreward = NULL;
+        const char *claim = NULL, *nreward = NULL, *mweb_data = NULL;
         size_t coinb1_size, coinb2_size;
         bool clean, ret = false;
         int merkle_count, i, p=0;
         json_t *merkle_arr;
+        json_t *mweb_param = NULL;
         uchar **merkle = NULL;
         // uchar(*merkle_tree)[32] = { 0 };
         int ntime;
@@ -1555,6 +1553,11 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
         stime = json_string_value(json_array_get(params, p++));
         clean = json_is_true(json_array_get(params, p)); p++;
         nreward = json_string_value(json_array_get(params, p++));
+        // Check for optional MWEB data field (only if parameter exists - for MWEB-enabled pools)
+        mweb_param = json_array_get(params, p);
+        if (mweb_param && json_is_string(mweb_param)) {
+                mweb_data = json_string_value(mweb_param);
+        }
 
         if (!job_id || !prevhash || !coinb1 || !coinb2 || !version || !nbits || !stime ||
             strlen(prevhash) != 64 || strlen(version) != 8 ||
@@ -1625,6 +1628,19 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
                         hex2bin(sctx->job.nreward, nreward, 2);
         }
         sctx->job.clean = clean;
+        
+        // Store MWEB data if present (for MWEB-enabled mining)
+        free(sctx->job.mweb_data);
+        sctx->job.mweb_data = NULL;
+        sctx->job.mweb_size = 0;
+        if (mweb_data && strlen(mweb_data) > 0) {
+                sctx->job.mweb_size = strlen(mweb_data) / 2; // hex string to bytes
+                sctx->job.mweb_data = (uchar*) malloc(sctx->job.mweb_size);
+                hex2bin(sctx->job.mweb_data, mweb_data, sctx->job.mweb_size);
+                if (opt_protocol) {
+                        applog(LOG_DEBUG, "MWEB data received: %zu bytes", sctx->job.mweb_size);
+                }
+        }
 
         sctx->job.diff = sctx->next_diff;
 
@@ -1634,6 +1650,26 @@ static bool stratum_notify(struct stratum_ctx *sctx, json_t *params)
 
 out:
         return ret;
+}
+
+// MWEB helper function implementation
+extern "C" char* format_mweb_block(const char* block_hex, const uchar* mweb_data, size_t mweb_size) {
+    if (!block_hex || !mweb_data || mweb_size == 0) {
+        return NULL;
+    }
+    
+    char* mweb_hex = bin2hex(mweb_data, mweb_size);
+    if (!mweb_hex) return NULL;
+    
+    size_t total_len = strlen(block_hex) + 2 + strlen(mweb_hex) + 1; // block + "01" + mweb + \0
+    char* mweb_block = (char*)malloc(total_len);
+    
+    if (mweb_block) {
+        sprintf(mweb_block, "%s01%s", block_hex, mweb_hex);
+    }
+    
+    free(mweb_hex);
+    return mweb_block;
 }
 
 extern volatile time_t g_work_time;

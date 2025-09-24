@@ -1896,7 +1896,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
                 case ALGO_SHA3D:
                         work_set_target(work, sctx->job.diff / opt_difficulty);
                 default:
-                        equi_work_set_target(work, sctx->job.diff / opt_difficulty);
+                        work_set_target(work, sctx->job.diff / opt_difficulty);
         }
 
         if (stratum_diff != sctx->job.diff) {

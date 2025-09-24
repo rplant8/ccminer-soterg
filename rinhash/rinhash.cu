@@ -13,7 +13,7 @@
 #include "blake3_device.cuh"
 
 // 🚀 GTX 1060 3GB OPTIMIZED: Balance memory usage vs performance
-#define MAX_BATCH_BLOCKS 32768
+#define MAX_BATCH_BLOCKS 2048
 
 // Kernel đơn: mỗi lần chỉ chạy 1 thread
 extern "C" __global__ void rinhash_cuda_kernel(
@@ -165,7 +165,7 @@ extern "C" void rinhash_cuda(const uint8_t* input, size_t input_len, uint8_t* ou
     if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy input fail\n"); cudaFree(d_input); cudaFree(d_output); cudaFree(d_memory); return; }
 
     // Launch kernel
-    rinhash_cuda_kernel<<<512, 4096>>>(d_input, input_len, d_output, d_memory, m_cost);
+    rinhash_cuda_kernel<<<1, 1>>>(d_input, input_len, d_output, d_memory, m_cost);
     cudaDeviceSynchronize();
     check_cuda("rinhash_cuda_kernel");
 
@@ -459,6 +459,52 @@ extern "C" void RinHash_mine(
         if (is_better(current_hash, best_hash)) {
             memcpy(best_hash, current_hash, 32);
             *found_nonce = start_nonce + i;
+        }
+    }
+}
+
+// MWEB-enhanced hash function
+extern "C" void RinHash_MWEB(
+    const uint32_t* version,
+    const uint32_t* prev_block,
+    const uint32_t* merkle_root,
+    const uint32_t* timestamp,
+    const uint32_t* bits,
+    const uint32_t* nonce,
+    const uint8_t* mweb_hash,      // MWEB extension block hash (32 bytes)
+    uint8_t mweb_present,          // 1 if MWEB data is present, 0 otherwise
+    uint8_t* output
+) {
+    // Use standard RinHash as base
+    RinHash(version, prev_block, merkle_root, timestamp, bits, nonce, output);
+    
+    // If MWEB is present, XOR with MWEB hash for additional mixing
+    if (mweb_present && mweb_hash) {
+        for (int i = 0; i < 32; i++) {
+            output[i] ^= mweb_hash[i % 32];
+        }
+    }
+}
+
+// MWEB-enhanced mining function  
+extern "C" void RinHash_MWEB_mine(
+    const uint32_t* work_data,
+    uint32_t nonce_offset,
+    uint32_t start_nonce,
+    uint32_t num_nonces,
+    uint32_t* found_nonce,
+    uint8_t* target_hash,
+    uint8_t* best_hash,
+    const uint8_t* mweb_hash,      // MWEB extension block hash
+    uint8_t mweb_present           // MWEB presence flag
+) {
+    // Use regular mining then post-process if MWEB is present
+    RinHash_mine(work_data, nonce_offset, start_nonce, num_nonces, found_nonce, target_hash, best_hash);
+    
+    // Apply MWEB mixing to best hash if present
+    if (mweb_present && mweb_hash) {
+        for (int i = 0; i < 32; i++) {
+            best_hash[i] ^= mweb_hash[i % 32];
         }
     }
 }

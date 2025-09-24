@@ -1166,7 +1166,7 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
                 /* build JSON-RPC request */
                 sprintf(s,
                         "{\"method\": \"getwork\", \"params\": [\"%s\"], \"id\":10}\r\n",
-                        str);
+                        submission_data);
 
                 /* issue JSON-RPC request */
                 val = json_rpc_call_pool(curl, pool, s, false, false, NULL);
@@ -1187,6 +1187,9 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
                 json_decref(val);
 
                 free(str);
+                if (submission_data != str) {
+                        free(submission_data); // Free MWEB block if allocated
+                }
         }
 
         return true;
@@ -1893,7 +1896,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
                 case ALGO_SHA3D:
                         work_set_target(work, sctx->job.diff / opt_difficulty);
                 default:
-                        work_set_target(work, sctx->job.diff / opt_difficulty);
+                        equi_work_set_target(work, sctx->job.diff / opt_difficulty);
         }
 
         if (stratum_diff != sctx->job.diff) {

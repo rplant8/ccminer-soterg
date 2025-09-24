@@ -13,7 +13,7 @@
 #include "blake3_device.cuh"
 
 // 🚀 GTX 1060 3GB OPTIMIZED: Balance memory usage vs performance
-#define MAX_BATCH_BLOCKS 2048
+#define MAX_BATCH_BLOCKS 32768
 
 // Kernel đơn: mỗi lần chỉ chạy 1 thread
 extern "C" __global__ void rinhash_cuda_kernel(

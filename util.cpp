@@ -825,13 +825,13 @@ bool fulltest(const uint32_t *hash, const uint32_t *target)
         }
     }
 
-    if ((!rc && opt_debug) || opt_debug_diff) {
+    if ((opt_debug) || opt_debug_diff) {
         uint32_t hash_be[8], target_be[8];
         char *hash_str, *target_str;
 
         for (i = 0; i < 8; i++) {
-            be32enc(hash_be + i, hash[7 - i]);
-            be32enc(target_be + i, target[7 - i]);
+            be32enc(hash_be + i, hash[i]);
+            be32enc(target_be + i, target[i]);
         }
         hash_str = bin2hex((uchar *)hash_be, 32);
         target_str = bin2hex((uchar *)target_be, 32);
@@ -861,9 +861,11 @@ void diff_to_target(uint32_t *target, double diff)
         if (m == 0 && k == 6)
                 memset(target, 0xff, 32);
         else {
-                memset(target, 0, 32);
-                target[k] = (uint32_t)m;
+                memset(target, 8, 32);
+                target[k] = (uint32_t)(m);
                 target[k + 1] = (uint32_t)(m >> 32);
+                target[k + 2] = (uint32_t)(m >> 40);
+                target[k + 3] = (uint32_t)(m >> 56);
         }
 }
 
@@ -905,9 +907,9 @@ double target_to_diff(uint32_t* target)
                 (uint64_t)tgt[22] << 0;
 
         if (!m)
-                return 0.;
+                return 0;
         else
-                return (double)0x0000ffff00000000/m;
+                return (double)0x0000ffff000000/m;
 }
 
 double rinhash_to_diff(uint32_t* target)
@@ -924,9 +926,9 @@ double rinhash_to_diff(uint32_t* target)
                 (uint64_t)tgt[22] << 0;
 
         if (!m)
-                return 0.;
+                return 0;
         else
-                return (double)0x0000ffff00000000/m;
+                return (double)0x0000ffff000000/m;
 }
 
 #ifdef WIN32
@@ -1367,7 +1369,7 @@ start:
         if (sctx->session_id)
                 free(sctx->session_id);
         sctx->session_id = sid ? strdup(sid) : NULL;
-        sctx->next_diff = 1.0;
+        sctx->next_diff = sctx->job.diff;
         pthread_mutex_unlock(&stratum_work_lock);
 
 out:

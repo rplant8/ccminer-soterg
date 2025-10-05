@@ -14,6 +14,7 @@
 // SHA3 state
 typedef struct {
     uint64_t state[25];
+    size_t pos;  // Track position for proper padding
 } sha3_state;
 
 // Rotation constants
@@ -97,20 +98,28 @@ __device__ void sha3_init(sha3_state* s) {
     for (int i = 0; i < 25; i++) {
         s->state[i] = 0;
     }
+    s->pos = 0;
 }
 
 // Update SHA3 state with input data
 __device__ void sha3_update(sha3_state* s, const uint8_t* in, size_t inlen) {
-    size_t i;
+    size_t i = 0;
     uint8_t* state = (uint8_t*)s->state;
     
-    // XOR input into state
-    for (i = 0; i < inlen; i++) {
-        state[i % SHA3_256_RATE] ^= in[i];
-        
-        if ((i + 1) % SHA3_256_RATE == 0) {
-            sha3_keccakf(s->state);
+    // Process complete blocks
+    while (i + SHA3_256_RATE <= inlen) {
+        // XOR input block into state
+        for (size_t j = 0; j < SHA3_256_RATE; j++) {
+            state[j] ^= in[i + j];
         }
+        sha3_keccakf(s->state);
+        i += SHA3_256_RATE;
+    }
+    
+    // XOR remaining bytes (will be padded in finalize)
+    s->pos = 0;
+    for (; i < inlen; i++, s->pos++) {
+        state[s->pos] ^= in[i];
     }
 }
 
@@ -118,8 +127,9 @@ __device__ void sha3_update(sha3_state* s, const uint8_t* in, size_t inlen) {
 __device__ void sha3_final(sha3_state* s, uint8_t* md) {
     uint8_t* state = (uint8_t*)s->state;
     
-    // Padding: add 0x06 (domain separator for SHA3-256) followed by 10*1
-    state[0] ^= 0x06;
+    // SHA3-256 padding: add 0x06 at position after last data byte
+    // then add 0x80 at last byte of rate
+    state[s->pos] ^= 0x06;
     state[SHA3_256_RATE - 1] ^= 0x80;
     
     // Final permutation

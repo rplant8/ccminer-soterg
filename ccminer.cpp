@@ -244,6 +244,7 @@ static size_t pk_script_size = 0;
 static char* lp_id;
 bool opt_segwit_mode = false;
 bool opt_eco_mode = false;
+bool opt_mweb_mode = false;
 char* yescrypt_key = NULL;
 size_t yescrypt_key_len = 0;
 uint32_t yescrypt_param_N = 0;
@@ -366,6 +367,7 @@ Options:\n\
       --submit-stale    ignore stale jobs checks, may create more rejected shares\n\
       --eco             use eco mode (Lyra2REv2 only)\n\
       --segwit          Agree with Segwit (Solo Mining only)\n\
+      --mweb            Enable MWEB (Mimblewimble Extension Blocks) for RinHash\n\
       --coinbase-addr=ADDR  payout address for solo mining\n\
       --no-getwork      disable getwork support\n\
           --yescrypt-param  set params(N,r,p) for yescrypt\n\
@@ -518,6 +520,7 @@ struct option options[] = {
         { "segwit", 0, NULL, 1083 },
         { "yescrypt-param", 1, NULL, 1084 },
         { "yescrypt-key", 1, NULL, 1085 },
+        { "mweb", 0, NULL, 1086 },
         { 0, 0, 0, 0 }
 };
 
@@ -936,7 +939,8 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
         bool stale_work = false;
         int idnonce = work->submit_nonce_id;
 
-        if (pool->type & POOL_STRATUM && stratum.rpc2) {
+        // Removed specialized rpc2 submission - using unified standard submission below
+        if (false && pool->type & POOL_STRATUM && stratum.rpc2) {
                 struct work submit_work;
                 memcpy(&submit_work, work, sizeof(struct work));
                 if (!hashlog_already_submittted(submit_work.job_id, submit_work.nonces[idnonce])) {
@@ -947,7 +951,8 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
                 return true;
         }
 
-        if (pool->type & POOL_STRATUM && stratum.is_equihash) {
+        // Removed specialized equihash submission - using unified standard submission below
+        if (false && pool->type & POOL_STRATUM && stratum.is_equihash) {
                 struct work submit_work;
                 memcpy(&submit_work, work, sizeof(struct work));
                 //if (!hashlog_already_submittted(submit_work.job_id, submit_work.nonces[idnonce])) {
@@ -1241,20 +1246,36 @@ static char *build_gbt_req() {
         snprintf(gbt_buffer, sizeof(gbt_buffer),
             "{\"method\": \"getblocktemplate\", \"params\": [{"
             "\"rules\": [\"segwit\", \"mweb\"]"
-            "}], \"id\":9}\r\n");
+            "}], \"id\":0}\r\n");
     } else {
         snprintf(gbt_buffer, sizeof(gbt_buffer),
             "{\"method\": \"getblocktemplate\", \"params\": [{"
-            "}], \"id\":9}\r\n");
+            "}], \"id\":0}\r\n");
     }
     return gbt_buffer;
 }
 
 #define GBT_CAPABILITIES "[\"coinbasetxn\", \"coinbasevalue\", \"longpoll\", \"workid\"]"
+
+#define GBT_RULES "[\"segwit\"]"
+
+#define GBT_MWEB_RULES "[\"segwit\", \"mweb\"]"
+
 static const char *gbt_req =
-        "{\"method\": \"getblocktemplate\", \"params\": [{"
-        //      "\"capabilities\": " GBT_CAPABILITIES ""
-        "}], \"id\":9}\r\n";
+        "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+        GBT_CAPABILITIES ", \"rules\": " GBT_RULES
+        "}], \"id\":0}\r\n";
+
+const char *gbt_lp_req =
+   "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+   GBT_CAPABILITIES ", \"rules\": " GBT_RULES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
+
+static const char *gbt_mweb_req =
+   "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+   GBT_CAPABILITIES ", \"rules\": " GBT_MWEB_RULES "}], \"id\":0}\r\n";
+const char *gbt_lp_mweb_req =
+   "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+   GBT_CAPABILITIES ", \"rules\": " GBT_MWEB_RULES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
 
 static bool get_blocktemplate(CURL *curl, struct work *work)
 {
@@ -1372,21 +1393,21 @@ static bool get_upstream_work(CURL *curl, struct work *work)
         if (have_stratum || unlikely(work->pooln != cur_pooln)) {
                 if (val)
                         json_decref(val);
-                return false;
+                return true;
         }
 
         if (!val)
                 return false;
 
-        rc = work_decode(json_object_get(val, "result"), work);
+        rc = gbt_work_decode(json_object_get(val, "result"), work);
 
         if (opt_protocol && rc) {
                 timeval_subtract(&diff, &tv_end, &tv_start);
                 /* show time because curl can be slower against versions/config */
-                applog(LOG_DEBUG, "got new work in %.2f ms",
+                applog(LOG_INFO, "%s new work received in %.2f ms",
+                       //( have_gbt ? "GBT" : "GetWork" ),
                        (1000.0 * diff.tv_sec) + (0.001 * diff.tv_usec));
         }
-
         json_decref(val);
 
         get_mininginfo(curl, work);
@@ -1891,7 +1912,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
                         equi_work_set_target(work, sctx->job.diff / opt_difficulty);
                         break;
                 case ALGO_RINHASH:
-                        rinhash_work_set_target(work, sctx->job.diff / opt_difficulty);
+                        work_set_target(work, sctx->job.diff / opt_difficulty);
                         break;
                 case ALGO_SHA3D:
                         work_set_target(work, sctx->job.diff / opt_difficulty);
@@ -3965,6 +3986,9 @@ void parse_arg(int key, char *arg)
                 break;
         case 1199:
                 pool_set_attr(cur_pooln, "disabled", arg);
+                break;
+        case 1086: /* --mweb */
+                opt_mweb_mode = true;
                 break;
 
         case 'V':

@@ -88,7 +88,7 @@ int scanhash_rinhash(int thr_id, struct work *work, uint32_t max_nonce, unsigned
         ptarget[7] = 0xff;
 
     // Set up batch mining parameters
-    uint32_t batch_size = 8192; // Number of nonces to try in each batch
+    uint32_t batch_size = 4096; // Number of nonces to try in each batch
     uint32_t found_nonce = 0;
     uint8_t best_hash[32];
     uint8_t target_hash[32];
@@ -160,17 +160,17 @@ int scanhash_rinhash(int thr_id, struct work *work, uint32_t max_nonce, unsigned
             for (int i = 0; i < 8; i++) {
                 // GPU outputs little-endian bytes, but we need to match ptarget word order
                 // ptarget[7] is most significant word for comparison
-                vhash[7-i] = 0;
-                vhash[7-i] |= best_hash[i*4+0];        // Keep little-endian bytes
-                vhash[7-i] |= best_hash[i*4+1] << 8;
-                vhash[7-i] |= best_hash[i*4+2] << 16;
-                vhash[7-i] |= best_hash[i*4+3] << 24;
+                vhash[i] = 0;
+                vhash[i] |= best_hash[i*4+0];        // Keep little-endian bytes
+                vhash[i] |= best_hash[i*4+1] << 8;
+                vhash[i] |= best_hash[i*4+2] << 16;
+                vhash[i] |= best_hash[i*4+3] << 24;
             }
             
             const uint32_t Htarg = ptarget[7];
             if (vhash[7] <= Htarg && fulltest(vhash, ptarget)) {
                 work->valid_nonces = 1;
-                rinhash_work_set_target_ratio(work, vhash);
+                work_set_target_ratio(work, vhash);
                 work->nonces[0] = found_nonce;
                 pdata[19] = found_nonce + 1;
                 return 1;

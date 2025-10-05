@@ -12,10 +12,67 @@
 #include "sha3-256.cu"
 #include "blake3_device.cuh"
 
-// 🚀 GTX 1060 3GB OPTIMIZED: Balance memory usage vs performance
-#define MAX_BATCH_BLOCKS 32768
+// Include CPU Argon2d reference implementation
+extern "C" {
+#include "argon2d/argon2ref/argon2.h"
+}
 
-// Kernel đơn: mỗi lần chỉ chạy 1 thread
+// 🚀 GTX 1060 3GB OPTIMIZED: Balance memory usage vs performance
+#define MAX_BATCH_BLOCKS 4096
+
+// Kernel chỉ chạy BLAKE3 (GPU)
+extern "C" __global__ void blake3_only_kernel(
+    const uint8_t* input, 
+    size_t input_len, 
+    uint8_t* output
+) {
+    if (threadIdx.x == 0) {
+        light_hash_device(input, input_len, output);
+    }
+}
+
+// Kernel chỉ chạy SHA3-256 (GPU)
+extern "C" __global__ void sha3_256_only_kernel(
+    const uint8_t* input,
+    uint8_t* output
+) {
+    if (threadIdx.x == 0) {
+        sha3_256_device(input, 32, output);
+    }
+}
+
+// Kernel batch chỉ chạy BLAKE3 (GPU) - cho batch processing
+extern "C" __global__ void blake3_batch_kernel(
+    const uint8_t* headers,
+    size_t header_len,
+    uint8_t* outputs,
+    uint32_t num_blocks
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_blocks) return;
+    
+    const uint8_t* input = headers + tid * header_len;
+    uint8_t* output = outputs + tid * 32;
+    
+    light_hash_device(input, header_len, output);
+}
+
+// Kernel batch chỉ chạy SHA3-256 (GPU) - cho batch processing
+extern "C" __global__ void sha3_256_batch_kernel(
+    const uint8_t* inputs,
+    uint8_t* outputs,
+    uint32_t num_blocks
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_blocks) return;
+    
+    const uint8_t* input = inputs + tid * 32;
+    uint8_t* output = outputs + tid * 32;
+    
+    sha3_256_device(input, 32, output);
+}
+
+// Kernel đơn: OLD VERSION - giữ để tương thích ngược
 extern "C" __global__ void rinhash_cuda_kernel(
     const uint8_t* input, 
     size_t input_len, 
@@ -141,45 +198,81 @@ extern "C" void rinhash_cuda_cleanup_persistent() {
     cudaDeviceReset();
 }
 
-// RinHash CUDA implementation (single)
+// RinHash CUDA implementation (single) - HYBRID: GPU BLAKE3 + CPU Argon2d + GPU SHA3-256
 extern "C" void rinhash_cuda(const uint8_t* input, size_t input_len, uint8_t* output) {
     uint8_t *d_input = nullptr;
-    uint8_t *d_output = nullptr;
-    block* d_memory = nullptr;
-    uint32_t m_cost = 64;
-
+    uint8_t *d_blake3_out = nullptr;
+    uint8_t *d_sha3_out = nullptr;
+    
     cudaError_t err;
 
-    // Alloc device memory
+    // Alloc device memory for BLAKE3
     err = cudaMalloc(&d_input, input_len);
     if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc input fail\n"); return; }
 
-    err = cudaMalloc(&d_output, 32);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc output fail\n"); cudaFree(d_input); return; }
-
-    err = cudaMalloc(&d_memory, m_cost * sizeof(block));
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc argon2 memory fail\n"); cudaFree(d_input); cudaFree(d_output); return; }
+    err = cudaMalloc(&d_blake3_out, 32);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc blake3 output fail\n"); cudaFree(d_input); return; }
 
     // Copy input
     err = cudaMemcpy(d_input, input, input_len, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy input fail\n"); cudaFree(d_input); cudaFree(d_output); cudaFree(d_memory); return; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy input fail\n"); cudaFree(d_input); cudaFree(d_blake3_out); return; }
 
-    // Launch kernel
-    rinhash_cuda_kernel<<<1, 1>>>(d_input, input_len, d_output, d_memory, m_cost);
+    // Step 1: Launch BLAKE3 kernel (GPU)
+    blake3_only_kernel<<<1, 1>>>(d_input, input_len, d_blake3_out);
     cudaDeviceSynchronize();
-    check_cuda("rinhash_cuda_kernel");
+    check_cuda("blake3_only_kernel");
 
-    // Copy result
-    err = cudaMemcpy(output, d_output, 32, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy output fail\n"); }
+    // Copy BLAKE3 result to CPU
+    uint8_t blake3_out[32];
+    err = cudaMemcpy(blake3_out, d_blake3_out, 32, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy blake3 output fail\n"); cudaFree(d_input); cudaFree(d_blake3_out); return; }
+
+    // Step 2: Run Argon2d on CPU
+    uint8_t argon2_out[32];
+    uint8_t salt[11] = { 'R','i','n','C','o','i','n','S','a','l','t' };
+    
+    int result = argon2d_hash_raw(
+        2,          // t_cost (iterations)
+        64,         // m_cost (memory in KB)
+        1,          // parallelism (lanes)
+        blake3_out, // pwd
+        32,         // pwdlen
+        salt,       // salt
+        sizeof(salt), // saltlen
+        argon2_out, // hash output
+        32          // hashlen
+    );
+    
+    if (result != ARGON2_OK) {
+        fprintf(stderr, "Argon2d CPU error: %s\n", argon2_error_message(result));
+        cudaFree(d_input);
+        cudaFree(d_blake3_out);
+        return;
+    }
+
+    // Step 3: Run SHA3-256 on GPU
+    err = cudaMalloc(&d_sha3_out, 32);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc sha3 output fail\n"); cudaFree(d_input); cudaFree(d_blake3_out); return; }
+    
+    // Reuse d_blake3_out buffer for argon2 result
+    err = cudaMemcpy(d_blake3_out, argon2_out, 32, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy argon2 output fail\n"); cudaFree(d_input); cudaFree(d_blake3_out); cudaFree(d_sha3_out); return; }
+    
+    sha3_256_only_kernel<<<1, 1>>>(d_blake3_out, d_sha3_out);
+    cudaDeviceSynchronize();
+    check_cuda("sha3_256_only_kernel");
+
+    // Copy final result
+    err = cudaMemcpy(output, d_sha3_out, 32, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy sha3 output fail\n"); }
 
     // Free
     cudaFree(d_input);
-    cudaFree(d_output);
-    cudaFree(d_memory);
+    cudaFree(d_blake3_out);
+    cudaFree(d_sha3_out);
 }
 
-// 🚀 OPTIMIZED: Target-aware batch processing for faster mining
+// 🚀 OPTIMIZED: Target-aware batch processing - HYBRID: GPU BLAKE3 + CPU Argon2d + GPU SHA3-256
 extern "C" void rinhash_cuda_batch_optimized(
     const uint8_t* block_headers,
     size_t block_header_len,
@@ -194,67 +287,112 @@ extern "C" void rinhash_cuda_batch_optimized(
         return;
     }
 
-    uint8_t *d_headers = nullptr, *d_outputs = nullptr;
-    block* d_memories = nullptr;
-    uint32_t *d_target = nullptr, *d_solution_found = nullptr, *d_solution_nonce = nullptr;
-    uint32_t m_cost = 64;
+    uint8_t *d_headers = nullptr;
+    uint8_t *d_blake3_outputs = nullptr;
+    uint8_t *d_sha3_outputs = nullptr;
     
     size_t headers_size = block_header_len * num_blocks;
     size_t outputs_size = 32 * num_blocks;
-    size_t memories_size = num_blocks * m_cost * sizeof(block);
 
-    // 🚀 GTX 1060 OPTIMIZED: Define thread configuration first
     const int threads_per_block = 256;
     int blocks = (num_blocks + threads_per_block - 1) / threads_per_block;
 
-    // Allocate GPU memory
     cudaError_t err;
+    
+    // Allocate GPU memory
     err = cudaMalloc(&d_headers, headers_size);
     if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc headers fail\n"); return; }
-    err = cudaMalloc(&d_outputs, outputs_size);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc outputs fail\n"); cudaFree(d_headers); return; }
-    err = cudaMalloc(&d_memories, memories_size);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc argon2 memories fail\n"); cudaFree(d_headers); cudaFree(d_outputs); return; }
-    err = cudaMalloc(&d_target, 8 * sizeof(uint32_t));
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc target fail\n"); goto cleanup; }
-    err = cudaMalloc(&d_solution_found, sizeof(uint32_t));
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc solution_found fail\n"); goto cleanup; }
-    err = cudaMalloc(&d_solution_nonce, sizeof(uint32_t));
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc solution_nonce fail\n"); goto cleanup; }
+    err = cudaMalloc(&d_blake3_outputs, outputs_size);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc blake3 outputs fail\n"); cudaFree(d_headers); return; }
+    err = cudaMalloc(&d_sha3_outputs, outputs_size);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc sha3 outputs fail\n"); cudaFree(d_headers); cudaFree(d_blake3_outputs); return; }
 
-    // Initialize data
-    cudaMemset(d_outputs, 0xee, outputs_size);
-    cudaMemset(d_solution_found, 0, sizeof(uint32_t));
-    cudaMemcpy(d_headers, block_headers, headers_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_target, target, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    // Declare variables before any goto to avoid bypass initialization error
+    std::vector<uint8_t> blake3_outputs(outputs_size);
+    std::vector<uint8_t> argon2_outputs(outputs_size);
+    uint8_t salt[11] = { 'R','i','n','C','o','i','n','S','a','l','t' };
     
-    rinhash_cuda_kernel_optimized<<<blocks, threads_per_block>>>(
-        d_headers, block_header_len, d_outputs, num_blocks, d_memories, m_cost,
-        d_target, d_solution_found, d_solution_nonce
+    // Copy headers to GPU
+    cudaMemcpy(d_headers, block_headers, headers_size, cudaMemcpyHostToDevice);
+
+    // Step 1: Run BLAKE3 on GPU (batch)
+    blake3_batch_kernel<<<blocks, threads_per_block>>>(
+        d_headers, block_header_len, d_blake3_outputs, num_blocks
     );
     cudaDeviceSynchronize();
-    check_cuda("rinhash_cuda_kernel_optimized");
+    check_cuda("blake3_batch_kernel");
 
-    // Copy results back
-    err = cudaMemcpy(outputs, d_outputs, outputs_size, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy output batch fail\n"); }
+    // Copy BLAKE3 results to CPU
+    err = cudaMemcpy(blake3_outputs.data(), d_blake3_outputs, outputs_size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy blake3 outputs fail\n"); goto cleanup; }
+
+    // Step 2: Run Argon2d on CPU for each block with target checking
+    *solution_found = 0;
     
-    err = cudaMemcpy(solution_found, d_solution_found, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy solution_found fail\n"); }
-    
-    err = cudaMemcpy(solution_nonce, d_solution_nonce, sizeof(uint32_t), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy solution_nonce fail\n"); }
+    for (uint32_t i = 0; i < num_blocks; i++) {
+        int result = argon2d_hash_raw(
+            2,          // t_cost
+            64,         // m_cost
+            1,          // parallelism
+            blake3_outputs.data() + i * 32, // pwd
+            32,         // pwdlen
+            salt,       // salt
+            sizeof(salt), // saltlen
+            argon2_outputs.data() + i * 32, // hash output
+            32          // hashlen
+        );
+        
+        if (result != ARGON2_OK) {
+            fprintf(stderr, "Argon2d CPU error for block %u: %s\n", i, argon2_error_message(result));
+            goto cleanup;
+        }
+    }
+
+    // Copy Argon2d results to GPU
+    err = cudaMemcpy(d_blake3_outputs, argon2_outputs.data(), outputs_size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy argon2 outputs fail\n"); goto cleanup; }
+
+    // Step 3: Run SHA3-256 on GPU (batch)
+    sha3_256_batch_kernel<<<blocks, threads_per_block>>>(
+        d_blake3_outputs, d_sha3_outputs, num_blocks
+    );
+    cudaDeviceSynchronize();
+    check_cuda("sha3_256_batch_kernel");
+
+    // Copy final results to host
+    err = cudaMemcpy(outputs, d_sha3_outputs, outputs_size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy sha3 outputs fail\n"); }
+
+    // Check for solution on CPU (since we have all hashes)
+    for (uint32_t i = 0; i < num_blocks; i++) {
+        uint32_t* hash_words = (uint32_t*)(outputs + i * 32);
+        bool meets_target = true;
+        
+        for (int j = 7; j >= 0; j--) {
+            if (hash_words[j] > target[j]) {
+                meets_target = false;
+                break;
+            } else if (hash_words[j] < target[j]) {
+                break;
+            }
+        }
+        
+        if (meets_target) {
+            *solution_found = 1;
+            // Extract nonce from header (last 4 bytes = offset 76)
+            uint32_t* header_words = (uint32_t*)(block_headers + i * block_header_len);
+            *solution_nonce = header_words[19];
+            break;
+        }
+    }
 
 cleanup:
     cudaFree(d_headers);
-    cudaFree(d_outputs);
-    cudaFree(d_memories);
-    cudaFree(d_target);
-    cudaFree(d_solution_found);
-    cudaFree(d_solution_nonce);
+    cudaFree(d_blake3_outputs);
+    cudaFree(d_sha3_outputs);
 }
 
-// Batch processing version for mining (legacy - kept for compatibility)
+// Batch processing version for mining - HYBRID: GPU BLAKE3 + CPU Argon2d + GPU SHA3-256
 extern "C" void rinhash_cuda_batch(
     const uint8_t* block_headers,
     size_t block_header_len,
@@ -266,39 +404,85 @@ extern "C" void rinhash_cuda_batch(
         return;
     }
 
-    uint8_t *d_headers = nullptr, *d_outputs = nullptr;
-    block* d_memories = nullptr;
-    uint32_t m_cost = 64;
+    uint8_t *d_headers = nullptr;
+    uint8_t *d_blake3_outputs = nullptr;
+    uint8_t *d_sha3_outputs = nullptr;
+    
     size_t headers_size = block_header_len * num_blocks;
     size_t outputs_size = 32 * num_blocks;
-    size_t memories_size = num_blocks * m_cost * sizeof(block);
 
     cudaError_t err;
+    
+    // Allocate GPU memory
     err = cudaMalloc(&d_headers, headers_size);
     if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc headers fail\n"); return; }
-    err = cudaMalloc(&d_outputs, outputs_size);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc outputs fail\n"); cudaFree(d_headers); return; }
-    err = cudaMalloc(&d_memories, memories_size);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc argon2 memories fail\n"); cudaFree(d_headers); cudaFree(d_outputs); return; }
+    err = cudaMalloc(&d_blake3_outputs, outputs_size);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc blake3 outputs fail\n"); cudaFree(d_headers); return; }
+    err = cudaMalloc(&d_sha3_outputs, outputs_size);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc sha3 outputs fail\n"); cudaFree(d_headers); cudaFree(d_blake3_outputs); return; }
 
-    cudaMemset(d_outputs, 0xee, outputs_size);
+    // Declare variables before any goto to avoid bypass initialization error
+    std::vector<uint8_t> blake3_outputs(outputs_size);
+    std::vector<uint8_t> argon2_outputs(outputs_size);
+    uint8_t salt[11] = { 'R','i','n','C','o','i','n','S','a','l','t' };
+    
+    // Copy headers to GPU
     cudaMemcpy(d_headers, block_headers, headers_size, cudaMemcpyHostToDevice);
 
-    // 🚀 GTX 1060 OPTIMIZED: 256 threads per block for better GPU utilization
+    // Step 1: Run BLAKE3 on GPU (batch)
     const int threads_per_block = 256;
     int blocks = (num_blocks + threads_per_block - 1) / threads_per_block;
-    rinhash_cuda_kernel_batch<<<blocks, threads_per_block>>>(
-        d_headers, block_header_len, d_outputs, num_blocks, d_memories, m_cost
+    
+    blake3_batch_kernel<<<blocks, threads_per_block>>>(
+        d_headers, block_header_len, d_blake3_outputs, num_blocks
     );
     cudaDeviceSynchronize();
-    check_cuda("rinhash_cuda_kernel_batch");
+    check_cuda("blake3_batch_kernel");
 
-    err = cudaMemcpy(outputs, d_outputs, outputs_size, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy output batch fail\n"); }
+    // Copy BLAKE3 results to CPU
+    err = cudaMemcpy(blake3_outputs.data(), d_blake3_outputs, outputs_size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy blake3 outputs fail\n"); goto cleanup; }
 
+    // Step 2: Run Argon2d on CPU for each block
+    
+    for (uint32_t i = 0; i < num_blocks; i++) {
+        int result = argon2d_hash_raw(
+            2,          // t_cost
+            64,         // m_cost
+            1,          // parallelism
+            blake3_outputs.data() + i * 32, // pwd
+            32,         // pwdlen
+            salt,       // salt
+            sizeof(salt), // saltlen
+            argon2_outputs.data() + i * 32, // hash output
+            32          // hashlen
+        );
+        
+        if (result != ARGON2_OK) {
+            fprintf(stderr, "Argon2d CPU error for block %u: %s\n", i, argon2_error_message(result));
+            goto cleanup;
+        }
+    }
+
+    // Copy Argon2d results to GPU
+    err = cudaMemcpy(d_blake3_outputs, argon2_outputs.data(), outputs_size, cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy argon2 outputs fail\n"); goto cleanup; }
+
+    // Step 3: Run SHA3-256 on GPU (batch)
+    sha3_256_batch_kernel<<<blocks, threads_per_block>>>(
+        d_blake3_outputs, d_sha3_outputs, num_blocks
+    );
+    cudaDeviceSynchronize();
+    check_cuda("sha3_256_batch_kernel");
+
+    // Copy final results to host
+    err = cudaMemcpy(outputs, d_sha3_outputs, outputs_size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy sha3 outputs fail\n"); }
+
+cleanup:
     cudaFree(d_headers);
-    cudaFree(d_outputs);
-    cudaFree(d_memories);
+    cudaFree(d_blake3_outputs);
+    cudaFree(d_sha3_outputs);
 }
 
 // Helper function to convert a block header to bytes

@@ -12,67 +12,34 @@
 #include "sha3-256.cu"
 #include "blake3_device.cuh"
 
-// Include CPU Argon2d reference implementation
-extern "C" {
-#include "argon2d/argon2ref/argon2.h"
-}
-
 // 🚀 GTX 1060 3GB OPTIMIZED: Balance memory usage vs performance
-#define MAX_BATCH_BLOCKS 4096
+#define MAX_BATCH_BLOCKS 65536
+#define OPTIMAL_THREADS_PER_BLOCK 512
+#define NUM_STREAMS 4
 
-// Kernel chỉ chạy BLAKE3 (GPU)
-extern "C" __global__ void blake3_only_kernel(
-    const uint8_t* input, 
-    size_t input_len, 
-    uint8_t* output
-) {
-    if (threadIdx.x == 0) {
-        light_hash_device(input, input_len, output);
-    }
-}
+// 🚀 PERSISTENT MEMORY: Tái sử dụng memory giữa các lần mining
+struct PersistentMemory {
+    uint8_t *d_headers;
+    uint8_t *d_outputs;
+    block *d_memories;
+    uint32_t *d_target;
+    uint32_t *d_solution_found;
+    uint32_t *d_solution_nonce;
+    uint8_t *h_headers_pinned;
+    uint8_t *h_outputs_pinned;
+    uint32_t *h_target_pinned;
+    uint32_t *h_solution_found_pinned;
+    uint32_t *h_solution_nonce_pinned;
+    cudaStream_t streams[NUM_STREAMS];
+    uint32_t allocated_blocks;
+    bool initialized;
+};
 
-// Kernel chỉ chạy SHA3-256 (GPU)
-extern "C" __global__ void sha3_256_only_kernel(
-    const uint8_t* input,
-    uint8_t* output
-) {
-    if (threadIdx.x == 0) {
-        sha3_256_device(input, 32, output);
-    }
-}
+// Thread-local persistent memory
+thread_local PersistentMemory g_persistent_mem = {0};
+thread_local uint32_t g_m_cost = 64;
 
-// Kernel batch chỉ chạy BLAKE3 (GPU) - cho batch processing
-extern "C" __global__ void blake3_batch_kernel(
-    const uint8_t* headers,
-    size_t header_len,
-    uint8_t* outputs,
-    uint32_t num_blocks
-) {
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_blocks) return;
-    
-    const uint8_t* input = headers + tid * header_len;
-    uint8_t* output = outputs + tid * 32;
-    
-    light_hash_device(input, header_len, output);
-}
-
-// Kernel batch chỉ chạy SHA3-256 (GPU) - cho batch processing
-extern "C" __global__ void sha3_256_batch_kernel(
-    const uint8_t* inputs,
-    uint8_t* outputs,
-    uint32_t num_blocks
-) {
-    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= num_blocks) return;
-    
-    const uint8_t* input = inputs + tid * 32;
-    uint8_t* output = outputs + tid * 32;
-    
-    sha3_256_device(input, 32, output);
-}
-
-// Kernel đơn: OLD VERSION - giữ để tương thích ngược
+// Kernel đơn: mỗi lần chỉ chạy 1 thread
 extern "C" __global__ void rinhash_cuda_kernel(
     const uint8_t* input, 
     size_t input_len, 
@@ -160,14 +127,14 @@ extern "C" __global__ void rinhash_cuda_kernel_optimized(
     // Check if hash meets target (little-endian comparison from back)
     bool meets_target = true;
     for (int i = 7; i >= 0; i--) {
-//        uint32_t* hash_words[i] = ((hash_words[i] & 0xFF) << 24) | 
-//                               ((hash_words[i] & 0xFF00) << 8) | 
-//                               ((hash_words[i] & 0xFF0000) >> 8) | 
-//                               ((hash_words[i] & 0xFF000000) >> 24);
-        if (hash_words[i] > target[i]) {
+        uint32_t swapped_hash = ((hash_words[i] & 0xFF) << 24) | 
+                               ((hash_words[i] & 0xFF00) << 8) | 
+                               ((hash_words[i] & 0xFF0000) >> 8) | 
+                               ((hash_words[i] & 0xFF000000) >> 24);
+        if (swapped_hash > target[i]) {
             meets_target = false;
             break;
-        } else if (hash_words[i] < target[i]) {
+        } else if (swapped_hash < target[i]) {
             break; // This hash is better, continue to set solution
         }
     }
@@ -192,207 +159,241 @@ inline void check_cuda(const char* msg) {
     }
 }
 
+// Forward declaration
+extern "C" void rinhash_persistent_cleanup();
+
+// 🚀 PERSISTENT MEMORY MANAGEMENT: Khởi tạo memory 1 lần duy nhất
+extern "C" void rinhash_persistent_init(uint32_t max_blocks) {
+    if (g_persistent_mem.initialized && g_persistent_mem.allocated_blocks >= max_blocks) {
+        return;
+    }
+    
+    if (g_persistent_mem.initialized) {
+        rinhash_persistent_cleanup();
+    }
+    
+    size_t headers_size = 80 * max_blocks;
+    size_t outputs_size = 32 * max_blocks;
+    size_t memories_size = max_blocks * g_m_cost * sizeof(block);
+    
+    cudaMalloc(&g_persistent_mem.d_headers, headers_size);
+    cudaMalloc(&g_persistent_mem.d_outputs, outputs_size);
+    cudaMalloc(&g_persistent_mem.d_memories, memories_size);
+    cudaMalloc(&g_persistent_mem.d_target, 8 * sizeof(uint32_t));
+    cudaMalloc(&g_persistent_mem.d_solution_found, sizeof(uint32_t));
+    cudaMalloc(&g_persistent_mem.d_solution_nonce, sizeof(uint32_t));
+    
+    cudaHostAlloc(&g_persistent_mem.h_headers_pinned, headers_size, cudaHostAllocDefault);
+    cudaHostAlloc(&g_persistent_mem.h_outputs_pinned, outputs_size, cudaHostAllocDefault);
+    cudaHostAlloc(&g_persistent_mem.h_target_pinned, 8 * sizeof(uint32_t), cudaHostAllocDefault);
+    cudaHostAlloc(&g_persistent_mem.h_solution_found_pinned, sizeof(uint32_t), cudaHostAllocDefault);
+    cudaHostAlloc(&g_persistent_mem.h_solution_nonce_pinned, sizeof(uint32_t), cudaHostAllocDefault);
+    
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        cudaStreamCreate(&g_persistent_mem.streams[i]);
+    }
+    
+    g_persistent_mem.allocated_blocks = max_blocks;
+    g_persistent_mem.initialized = true;
+    
+    fprintf(stderr, "✅ Persistent memory initialized: %u blocks (%.2f MB)\n", 
+            max_blocks, (headers_size + outputs_size + memories_size) / (1024.0 * 1024.0));
+}
+
+// 🚀 PERSISTENT MEMORY CLEANUP
+extern "C" void rinhash_persistent_cleanup() {
+    if (!g_persistent_mem.initialized) return;
+    
+    cudaFree(g_persistent_mem.d_headers);
+    cudaFree(g_persistent_mem.d_outputs);
+    cudaFree(g_persistent_mem.d_memories);
+    cudaFree(g_persistent_mem.d_target);
+    cudaFree(g_persistent_mem.d_solution_found);
+    cudaFree(g_persistent_mem.d_solution_nonce);
+    
+    cudaFreeHost(g_persistent_mem.h_headers_pinned);
+    cudaFreeHost(g_persistent_mem.h_outputs_pinned);
+    cudaFreeHost(g_persistent_mem.h_target_pinned);
+    cudaFreeHost(g_persistent_mem.h_solution_found_pinned);
+    cudaFreeHost(g_persistent_mem.h_solution_nonce_pinned);
+    
+    for (int i = 0; i < NUM_STREAMS; i++) {
+        cudaStreamDestroy(g_persistent_mem.streams[i]);
+    }
+    
+    memset(&g_persistent_mem, 0, sizeof(PersistentMemory));
+    fprintf(stderr, "🧹 Persistent memory cleaned up\n");
+}
+
 // Cleanup persistent GPU memory (required by rinhash_scanhash.cpp)
 extern "C" void rinhash_cuda_cleanup_persistent() {
     // Reset CUDA device to clean up any persistent memory
     cudaDeviceReset();
 }
 
-// RinHash CUDA implementation (single) - HYBRID: GPU BLAKE3 + CPU Argon2d + GPU SHA3-256
+// RinHash CUDA implementation (single)
 extern "C" void rinhash_cuda(const uint8_t* input, size_t input_len, uint8_t* output) {
     uint8_t *d_input = nullptr;
-    uint8_t *d_blake3_out = nullptr;
-    uint8_t *d_sha3_out = nullptr;
-    
+    uint8_t *d_output = nullptr;
+    block* d_memory = nullptr;
+    uint32_t m_cost = 64;
+
     cudaError_t err;
 
-    // Alloc device memory for BLAKE3
+    // Alloc device memory
     err = cudaMalloc(&d_input, input_len);
     if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc input fail\n"); return; }
 
-    err = cudaMalloc(&d_blake3_out, 32);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc blake3 output fail\n"); cudaFree(d_input); return; }
+    err = cudaMalloc(&d_output, 32);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc output fail\n"); cudaFree(d_input); return; }
+
+    err = cudaMalloc(&d_memory, m_cost * sizeof(block));
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc argon2 memory fail\n"); cudaFree(d_input); cudaFree(d_output); return; }
 
     // Copy input
     err = cudaMemcpy(d_input, input, input_len, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy input fail\n"); cudaFree(d_input); cudaFree(d_blake3_out); return; }
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy input fail\n"); cudaFree(d_input); cudaFree(d_output); cudaFree(d_memory); return; }
 
-    // Step 1: Launch BLAKE3 kernel (GPU)
-    blake3_only_kernel<<<1, 1>>>(d_input, input_len, d_blake3_out);
+    // Launch kernel
+    rinhash_cuda_kernel<<<1, 1>>>(d_input, input_len, d_output, d_memory, m_cost);
     cudaDeviceSynchronize();
-    check_cuda("blake3_only_kernel");
+    check_cuda("rinhash_cuda_kernel");
 
-    // Copy BLAKE3 result to CPU
-    uint8_t blake3_out[32];
-    err = cudaMemcpy(blake3_out, d_blake3_out, 32, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy blake3 output fail\n"); cudaFree(d_input); cudaFree(d_blake3_out); return; }
-
-    // Step 2: Run Argon2d on CPU
-    uint8_t argon2_out[32];
-    uint8_t salt[11] = { 'R','i','n','C','o','i','n','S','a','l','t' };
-    
-    int result = argon2d_hash_raw(
-        2,          // t_cost (iterations)
-        64,         // m_cost (memory in KB)
-        1,          // parallelism (lanes)
-        blake3_out, // pwd
-        32,         // pwdlen
-        salt,       // salt
-        sizeof(salt), // saltlen
-        argon2_out, // hash output
-        32          // hashlen
-    );
-    
-    if (result != ARGON2_OK) {
-        fprintf(stderr, "Argon2d CPU error: %s\n", argon2_error_message(result));
-        cudaFree(d_input);
-        cudaFree(d_blake3_out);
-        return;
-    }
-
-    // Step 3: Run SHA3-256 on GPU
-    err = cudaMalloc(&d_sha3_out, 32);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc sha3 output fail\n"); cudaFree(d_input); cudaFree(d_blake3_out); return; }
-    
-    // Reuse d_blake3_out buffer for argon2 result
-    err = cudaMemcpy(d_blake3_out, argon2_out, 32, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy argon2 output fail\n"); cudaFree(d_input); cudaFree(d_blake3_out); cudaFree(d_sha3_out); return; }
-    
-    sha3_256_only_kernel<<<1, 1>>>(d_blake3_out, d_sha3_out);
-    cudaDeviceSynchronize();
-    check_cuda("sha3_256_only_kernel");
-
-    // Copy final result
-    err = cudaMemcpy(output, d_sha3_out, 32, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy sha3 output fail\n"); }
+    // Copy result
+    err = cudaMemcpy(output, d_output, 32, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy output fail\n"); }
 
     // Free
     cudaFree(d_input);
-    cudaFree(d_blake3_out);
-    cudaFree(d_sha3_out);
+    cudaFree(d_output);
+    cudaFree(d_memory);
 }
 
-// 🚀 OPTIMIZED: Target-aware batch processing - HYBRID: GPU BLAKE3 + CPU Argon2d + GPU SHA3-256
+// 🚀 NEW: ULTRA-OPTIMIZED with persistent memory + streams + pipeline
+extern "C" void rinhash_cuda_batch_persistent(
+    const uint8_t* block_headers,
+    size_t block_header_len,
+    uint8_t* outputs,
+    uint32_t num_blocks,
+    uint32_t* target,
+    uint32_t* solution_found,
+    uint32_t* solution_nonce
+) {
+    if (num_blocks > MAX_BATCH_BLOCKS) {
+        fprintf(stderr, "Batch too large (max %u)\n", MAX_BATCH_BLOCKS);
+        return;
+    }
+    
+    rinhash_persistent_init(num_blocks);
+    
+    size_t headers_size = block_header_len * num_blocks;
+    size_t outputs_size = 32 * num_blocks;
+    
+    const int threads_per_block = OPTIMAL_THREADS_PER_BLOCK;
+    int blocks = (num_blocks + threads_per_block - 1) / threads_per_block;
+    
+    memcpy(g_persistent_mem.h_headers_pinned, block_headers, headers_size);
+    memcpy(g_persistent_mem.h_target_pinned, target, 8 * sizeof(uint32_t));
+    
+    cudaMemcpyAsync(g_persistent_mem.d_headers, g_persistent_mem.h_headers_pinned, 
+                    headers_size, cudaMemcpyHostToDevice, g_persistent_mem.streams[0]);
+    cudaMemcpyAsync(g_persistent_mem.d_target, g_persistent_mem.h_target_pinned, 
+                    8 * sizeof(uint32_t), cudaMemcpyHostToDevice, g_persistent_mem.streams[0]);
+    cudaMemsetAsync(g_persistent_mem.d_solution_found, 0, sizeof(uint32_t), g_persistent_mem.streams[0]);
+    
+    rinhash_cuda_kernel_optimized<<<blocks, threads_per_block, 0, g_persistent_mem.streams[0]>>>(
+        g_persistent_mem.d_headers, block_header_len, g_persistent_mem.d_outputs, 
+        num_blocks, g_persistent_mem.d_memories, g_m_cost,
+        g_persistent_mem.d_target, g_persistent_mem.d_solution_found, g_persistent_mem.d_solution_nonce
+    );
+    
+    cudaMemcpyAsync(g_persistent_mem.h_outputs_pinned, g_persistent_mem.d_outputs, 
+                    outputs_size, cudaMemcpyDeviceToHost, g_persistent_mem.streams[0]);
+    cudaMemcpyAsync(g_persistent_mem.h_solution_found_pinned, g_persistent_mem.d_solution_found, 
+                    sizeof(uint32_t), cudaMemcpyDeviceToHost, g_persistent_mem.streams[0]);
+    cudaMemcpyAsync(g_persistent_mem.h_solution_nonce_pinned, g_persistent_mem.d_solution_nonce, 
+                    sizeof(uint32_t), cudaMemcpyDeviceToHost, g_persistent_mem.streams[0]);
+    
+    cudaStreamSynchronize(g_persistent_mem.streams[0]);
+    check_cuda("rinhash_cuda_batch_persistent");
+    
+    memcpy(outputs, g_persistent_mem.h_outputs_pinned, outputs_size);
+    *solution_found = *g_persistent_mem.h_solution_found_pinned;
+    *solution_nonce = *g_persistent_mem.h_solution_nonce_pinned;
+}
+
+// 🚀 LEGACY: Target-aware batch processing (kept for compatibility)
 extern "C" void rinhash_cuda_batch_optimized(
     const uint8_t* block_headers,
     size_t block_header_len,
     uint8_t* outputs,
     uint32_t num_blocks,
-    uint32_t* target,           // Target for early termination
-    uint32_t* solution_found,   // Output: 1 if solution found
-    uint32_t* solution_nonce    // Output: winning nonce
+    uint32_t* target,
+    uint32_t* solution_found,
+    uint32_t* solution_nonce
 ) {
     if (num_blocks > MAX_BATCH_BLOCKS) {
         fprintf(stderr, "Batch too large (max %u)\n", MAX_BATCH_BLOCKS);
         return;
     }
 
-    uint8_t *d_headers = nullptr;
-    uint8_t *d_blake3_outputs = nullptr;
-    uint8_t *d_sha3_outputs = nullptr;
+    uint8_t *d_headers = nullptr, *d_outputs = nullptr;
+    block* d_memories = nullptr;
+    uint32_t *d_target = nullptr, *d_solution_found = nullptr, *d_solution_nonce = nullptr;
+    uint32_t m_cost = 64;
     
     size_t headers_size = block_header_len * num_blocks;
     size_t outputs_size = 32 * num_blocks;
+    size_t memories_size = num_blocks * m_cost * sizeof(block);
 
-    const int threads_per_block = 256;
+    const int threads_per_block = OPTIMAL_THREADS_PER_BLOCK;
     int blocks = (num_blocks + threads_per_block - 1) / threads_per_block;
 
     cudaError_t err;
-    
-    // Allocate GPU memory
     err = cudaMalloc(&d_headers, headers_size);
     if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc headers fail\n"); return; }
-    err = cudaMalloc(&d_blake3_outputs, outputs_size);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc blake3 outputs fail\n"); cudaFree(d_headers); return; }
-    err = cudaMalloc(&d_sha3_outputs, outputs_size);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc sha3 outputs fail\n"); cudaFree(d_headers); cudaFree(d_blake3_outputs); return; }
+    err = cudaMalloc(&d_outputs, outputs_size);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc outputs fail\n"); cudaFree(d_headers); return; }
+    err = cudaMalloc(&d_memories, memories_size);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc argon2 memories fail\n"); cudaFree(d_headers); cudaFree(d_outputs); return; }
+    err = cudaMalloc(&d_target, 8 * sizeof(uint32_t));
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc target fail\n"); goto cleanup; }
+    err = cudaMalloc(&d_solution_found, sizeof(uint32_t));
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc solution_found fail\n"); goto cleanup; }
+    err = cudaMalloc(&d_solution_nonce, sizeof(uint32_t));
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc solution_nonce fail\n"); goto cleanup; }
 
-    // Declare variables before any goto to avoid bypass initialization error
-    std::vector<uint8_t> blake3_outputs(outputs_size);
-    std::vector<uint8_t> argon2_outputs(outputs_size);
-    uint8_t salt[11] = { 'R','i','n','C','o','i','n','S','a','l','t' };
-    
-    // Copy headers to GPU
+    cudaMemset(d_outputs, 0xee, outputs_size);
+    cudaMemset(d_solution_found, 0, sizeof(uint32_t));
     cudaMemcpy(d_headers, block_headers, headers_size, cudaMemcpyHostToDevice);
-
-    // Step 1: Run BLAKE3 on GPU (batch)
-    blake3_batch_kernel<<<blocks, threads_per_block>>>(
-        d_headers, block_header_len, d_blake3_outputs, num_blocks
-    );
-    cudaDeviceSynchronize();
-    check_cuda("blake3_batch_kernel");
-
-    // Copy BLAKE3 results to CPU
-    err = cudaMemcpy(blake3_outputs.data(), d_blake3_outputs, outputs_size, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy blake3 outputs fail\n"); goto cleanup; }
-
-    // Step 2: Run Argon2d on CPU for each block with target checking
-    *solution_found = 0;
+    cudaMemcpy(d_target, target, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice);
     
-    for (uint32_t i = 0; i < num_blocks; i++) {
-        int result = argon2d_hash_raw(
-            2,          // t_cost
-            64,         // m_cost
-            1,          // parallelism
-            blake3_outputs.data() + i * 32, // pwd
-            32,         // pwdlen
-            salt,       // salt
-            sizeof(salt), // saltlen
-            argon2_outputs.data() + i * 32, // hash output
-            32          // hashlen
-        );
-        
-        if (result != ARGON2_OK) {
-            fprintf(stderr, "Argon2d CPU error for block %u: %s\n", i, argon2_error_message(result));
-            goto cleanup;
-        }
-    }
-
-    // Copy Argon2d results to GPU
-    err = cudaMemcpy(d_blake3_outputs, argon2_outputs.data(), outputs_size, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy argon2 outputs fail\n"); goto cleanup; }
-
-    // Step 3: Run SHA3-256 on GPU (batch)
-    sha3_256_batch_kernel<<<blocks, threads_per_block>>>(
-        d_blake3_outputs, d_sha3_outputs, num_blocks
+    rinhash_cuda_kernel_optimized<<<blocks, threads_per_block>>>(
+        d_headers, block_header_len, d_outputs, num_blocks, d_memories, m_cost,
+        d_target, d_solution_found, d_solution_nonce
     );
     cudaDeviceSynchronize();
-    check_cuda("sha3_256_batch_kernel");
+    check_cuda("rinhash_cuda_kernel_optimized");
 
-    // Copy final results to host
-    err = cudaMemcpy(outputs, d_sha3_outputs, outputs_size, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy sha3 outputs fail\n"); }
-
-    // Check for solution on CPU (since we have all hashes)
-    for (uint32_t i = 0; i < num_blocks; i++) {
-        uint32_t* hash_words = (uint32_t*)(outputs + i * 32);
-        bool meets_target = true;
-        
-        for (int j = 7; j >= 0; j--) {
-            if (hash_words[j] > target[j]) {
-                meets_target = false;
-                break;
-            } else if (hash_words[j] < target[j]) {
-                break;
-            }
-        }
-        
-        if (meets_target) {
-            *solution_found = 1;
-            // Extract nonce from header (last 4 bytes = offset 76)
-            uint32_t* header_words = (uint32_t*)(block_headers + i * block_header_len);
-            *solution_nonce = header_words[19];
-            break;
-        }
-    }
+    err = cudaMemcpy(outputs, d_outputs, outputs_size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy output batch fail\n"); }
+    
+    err = cudaMemcpy(solution_found, d_solution_found, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy solution_found fail\n"); }
+    
+    err = cudaMemcpy(solution_nonce, d_solution_nonce, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy solution_nonce fail\n"); }
 
 cleanup:
     cudaFree(d_headers);
-    cudaFree(d_blake3_outputs);
-    cudaFree(d_sha3_outputs);
+    cudaFree(d_outputs);
+    cudaFree(d_memories);
+    cudaFree(d_target);
+    cudaFree(d_solution_found);
+    cudaFree(d_solution_nonce);
 }
 
-// Batch processing version for mining - HYBRID: GPU BLAKE3 + CPU Argon2d + GPU SHA3-256
+// Batch processing version for mining (legacy - kept for compatibility)
 extern "C" void rinhash_cuda_batch(
     const uint8_t* block_headers,
     size_t block_header_len,
@@ -404,85 +405,39 @@ extern "C" void rinhash_cuda_batch(
         return;
     }
 
-    uint8_t *d_headers = nullptr;
-    uint8_t *d_blake3_outputs = nullptr;
-    uint8_t *d_sha3_outputs = nullptr;
-    
+    uint8_t *d_headers = nullptr, *d_outputs = nullptr;
+    block* d_memories = nullptr;
+    uint32_t m_cost = 64;
     size_t headers_size = block_header_len * num_blocks;
     size_t outputs_size = 32 * num_blocks;
+    size_t memories_size = num_blocks * m_cost * sizeof(block);
 
     cudaError_t err;
-    
-    // Allocate GPU memory
     err = cudaMalloc(&d_headers, headers_size);
     if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc headers fail\n"); return; }
-    err = cudaMalloc(&d_blake3_outputs, outputs_size);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc blake3 outputs fail\n"); cudaFree(d_headers); return; }
-    err = cudaMalloc(&d_sha3_outputs, outputs_size);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc sha3 outputs fail\n"); cudaFree(d_headers); cudaFree(d_blake3_outputs); return; }
+    err = cudaMalloc(&d_outputs, outputs_size);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc outputs fail\n"); cudaFree(d_headers); return; }
+    err = cudaMalloc(&d_memories, memories_size);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: alloc argon2 memories fail\n"); cudaFree(d_headers); cudaFree(d_outputs); return; }
 
-    // Declare variables before any goto to avoid bypass initialization error
-    std::vector<uint8_t> blake3_outputs(outputs_size);
-    std::vector<uint8_t> argon2_outputs(outputs_size);
-    uint8_t salt[11] = { 'R','i','n','C','o','i','n','S','a','l','t' };
-    
-    // Copy headers to GPU
+    cudaMemset(d_outputs, 0xee, outputs_size);
     cudaMemcpy(d_headers, block_headers, headers_size, cudaMemcpyHostToDevice);
 
-    // Step 1: Run BLAKE3 on GPU (batch)
+    // 🚀 GTX 1060 OPTIMIZED: 256 threads per block for better GPU utilization
     const int threads_per_block = 256;
     int blocks = (num_blocks + threads_per_block - 1) / threads_per_block;
-    
-    blake3_batch_kernel<<<blocks, threads_per_block>>>(
-        d_headers, block_header_len, d_blake3_outputs, num_blocks
+    rinhash_cuda_kernel_batch<<<blocks, threads_per_block>>>(
+        d_headers, block_header_len, d_outputs, num_blocks, d_memories, m_cost
     );
     cudaDeviceSynchronize();
-    check_cuda("blake3_batch_kernel");
+    check_cuda("rinhash_cuda_kernel_batch");
 
-    // Copy BLAKE3 results to CPU
-    err = cudaMemcpy(blake3_outputs.data(), d_blake3_outputs, outputs_size, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy blake3 outputs fail\n"); goto cleanup; }
+    err = cudaMemcpy(outputs, d_outputs, outputs_size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy output batch fail\n"); }
 
-    // Step 2: Run Argon2d on CPU for each block
-    
-    for (uint32_t i = 0; i < num_blocks; i++) {
-        int result = argon2d_hash_raw(
-            2,          // t_cost
-            64,         // m_cost
-            1,          // parallelism
-            blake3_outputs.data() + i * 32, // pwd
-            32,         // pwdlen
-            salt,       // salt
-            sizeof(salt), // saltlen
-            argon2_outputs.data() + i * 32, // hash output
-            32          // hashlen
-        );
-        
-        if (result != ARGON2_OK) {
-            fprintf(stderr, "Argon2d CPU error for block %u: %s\n", i, argon2_error_message(result));
-            goto cleanup;
-        }
-    }
-
-    // Copy Argon2d results to GPU
-    err = cudaMemcpy(d_blake3_outputs, argon2_outputs.data(), outputs_size, cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy argon2 outputs fail\n"); goto cleanup; }
-
-    // Step 3: Run SHA3-256 on GPU (batch)
-    sha3_256_batch_kernel<<<blocks, threads_per_block>>>(
-        d_blake3_outputs, d_sha3_outputs, num_blocks
-    );
-    cudaDeviceSynchronize();
-    check_cuda("sha3_256_batch_kernel");
-
-    // Copy final results to host
-    err = cudaMemcpy(outputs, d_sha3_outputs, outputs_size, cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) { fprintf(stderr, "CUDA: copy sha3 outputs fail\n"); }
-
-cleanup:
     cudaFree(d_headers);
-    cudaFree(d_blake3_outputs);
-    cudaFree(d_sha3_outputs);
+    cudaFree(d_outputs);
+    cudaFree(d_memories);
 }
 
 // Helper function to convert a block header to bytes
@@ -547,17 +502,72 @@ bool is_better(uint8_t* hash1, uint8_t* hash2) {
     return false; // equal
 }
 
-// 🚀 OPTIMIZED: Enhanced mining function with target-aware early termination
+// 🚀 ULTRA-OPTIMIZED: Persistent memory version for maximum performance
+extern "C" void RinHash_mine_persistent(
+    const uint32_t* work_data,
+    uint32_t nonce_offset,
+    uint32_t start_nonce,
+    uint32_t num_nonces,
+    uint32_t* target,
+    uint32_t* found_nonce,
+    uint8_t* target_hash,
+    uint8_t* best_hash,
+    uint32_t* solution_found
+) {
+    const size_t block_header_len = 80;
+    if (num_nonces > MAX_BATCH_BLOCKS) {
+        fprintf(stderr, "Mining batch too large (max %u)\n", MAX_BATCH_BLOCKS);
+        return;
+    }
+    
+    rinhash_persistent_init(num_nonces);
+    
+    uint32_t solution_nonce = 0;
+    
+    for (uint32_t i = 0; i < num_nonces; i++) {
+        uint32_t current_nonce = start_nonce + i;
+        uint32_t work_data_copy[20];
+        memcpy(work_data_copy, work_data, 80);
+        work_data_copy[nonce_offset] = current_nonce;
+        memcpy(&g_persistent_mem.h_headers_pinned[i * block_header_len], work_data_copy, 80);
+    }
+    
+    rinhash_cuda_batch_persistent(
+        g_persistent_mem.h_headers_pinned, block_header_len, 
+        g_persistent_mem.h_outputs_pinned, num_nonces,
+        target, solution_found, &solution_nonce
+    );
+    
+    if (*solution_found) {
+        *found_nonce = solution_nonce;
+        uint32_t winner_index = solution_nonce - start_nonce;
+        if (winner_index < num_nonces) {
+            memcpy(best_hash, g_persistent_mem.h_outputs_pinned + winner_index * 32, 32);
+        }
+    } else {
+        memcpy(best_hash, g_persistent_mem.h_outputs_pinned, 32);
+        *found_nonce = start_nonce;
+        for (uint32_t i = 1; i < num_nonces; i++) {
+            uint8_t* current_hash = g_persistent_mem.h_outputs_pinned + i * 32;
+            if (is_better(current_hash, best_hash)) {
+                memcpy(best_hash, current_hash, 32);
+                *found_nonce = start_nonce + i;
+            }
+        }
+    }
+}
+
+// 🚀 LEGACY: Enhanced mining function with target-aware early termination
 extern "C" void RinHash_mine_optimized(
     const uint32_t* work_data,
     uint32_t nonce_offset,
     uint32_t start_nonce,
     uint32_t num_nonces,
-    uint32_t* target,           // 8 x uint32_t target  
+    uint32_t* target,
     uint32_t* found_nonce,
     uint8_t* target_hash,
     uint8_t* best_hash,
-    uint32_t* solution_found    // 1 if target was met
+    uint32_t* solution_found
 ) {
     const size_t block_header_len = 80;
     if (num_nonces > MAX_BATCH_BLOCKS) {
@@ -569,7 +579,6 @@ extern "C" void RinHash_mine_optimized(
     std::vector<uint8_t> hashes(32 * num_nonces);
     uint32_t solution_nonce = 0;
 
-    // Prepare block headers with different nonces
     for (uint32_t i = 0; i < num_nonces; i++) {
         uint32_t current_nonce = start_nonce + i;
         uint32_t work_data_copy[20];
@@ -578,21 +587,18 @@ extern "C" void RinHash_mine_optimized(
         memcpy(&block_headers[i * block_header_len], work_data_copy, 80);
     }
 
-    // Use optimized kernel with target checking
     rinhash_cuda_batch_optimized(
         block_headers.data(), block_header_len, hashes.data(), num_nonces,
         target, solution_found, &solution_nonce
     );
 
     if (*solution_found) {
-        // Solution found! Extract the winning hash
         *found_nonce = solution_nonce;
         uint32_t winner_index = solution_nonce - start_nonce;
         if (winner_index < num_nonces) {
             memcpy(best_hash, hashes.data() + winner_index * 32, 32);
         }
     } else {
-        // No solution, find best hash
         memcpy(best_hash, hashes.data(), 32);
         *found_nonce = start_nonce;
         for (uint32_t i = 1; i < num_nonces; i++) {
@@ -643,52 +649,6 @@ extern "C" void RinHash_mine(
         if (is_better(current_hash, best_hash)) {
             memcpy(best_hash, current_hash, 32);
             *found_nonce = start_nonce + i;
-        }
-    }
-}
-
-// MWEB-enhanced hash function
-extern "C" void RinHash_MWEB(
-    const uint32_t* version,
-    const uint32_t* prev_block,
-    const uint32_t* merkle_root,
-    const uint32_t* timestamp,
-    const uint32_t* bits,
-    const uint32_t* nonce,
-    const uint8_t* mweb_hash,      // MWEB extension block hash (32 bytes)
-    uint8_t mweb_present,          // 1 if MWEB data is present, 0 otherwise
-    uint8_t* output
-) {
-    // Use standard RinHash as base
-    RinHash(version, prev_block, merkle_root, timestamp, bits, nonce, output);
-    
-    // If MWEB is present, XOR with MWEB hash for additional mixing
-    if (mweb_present && mweb_hash) {
-        for (int i = 0; i < 32; i++) {
-            output[i] ^= mweb_hash[i % 32];
-        }
-    }
-}
-
-// MWEB-enhanced mining function  
-extern "C" void RinHash_MWEB_mine(
-    const uint32_t* work_data,
-    uint32_t nonce_offset,
-    uint32_t start_nonce,
-    uint32_t num_nonces,
-    uint32_t* found_nonce,
-    uint8_t* target_hash,
-    uint8_t* best_hash,
-    const uint8_t* mweb_hash,      // MWEB extension block hash
-    uint8_t mweb_present           // MWEB presence flag
-) {
-    // Use regular mining then post-process if MWEB is present
-    RinHash_mine(work_data, nonce_offset, start_nonce, num_nonces, found_nonce, target_hash, best_hash);
-    
-    // Apply MWEB mixing to best hash if present
-    if (mweb_present && mweb_hash) {
-        for (int i = 0; i < 32; i++) {
-            best_hash[i] ^= mweb_hash[i % 32];
         }
     }
 }

@@ -1829,7 +1829,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		case ALGO_X16S:
 		case ALGO_X21S:
 		case ALGO_EVOHASH:
-			work_set_target(work, sctx->job.diff / (256.0 * opt_difficulty));
+			work_set_target(work, sctx->job.diff / (65536.0 * opt_difficulty));
 			break;
 		case ALGO_KECCAK:
 		case ALGO_LYRA2:
@@ -1842,9 +1842,9 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			rinhash_work_set_target(work, sctx->job.diff);
 			break;
 		case ALGO_SHA3D:
-			work_set_target(work, sctx->job.diff / opt_difficulty);
+			rinhash_work_set_target(work, sctx->job.diff / opt_difficulty);
 		default:
-			work_set_target(work, sctx->job.diff);
+			rinhash_work_set_target(work, sctx->job.diff);
 	}
 
 	if (stratum_diff != sctx->job.diff) {

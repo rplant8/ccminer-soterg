@@ -89,7 +89,7 @@ ccminer_SOURCES	= elist.h miner.h compat.h \
 			  x13/hsr.cu x13/cuda_hsr_sm3.cu x13/sm3.c \
 			  x15/x14.cu x15/x15.cu x15/cuda_x14_shabal512.cu x15/cuda_x15_whirlpool.cu \
 			  x15/whirlpool.cu x15/cuda_x15_whirlpool_sm3.cu \
-			  x16/x16r.cu x16/x16rt.cu x16/x16rv2.cu x16/x16s.cu x16/cuda_x16_echo512.cu x16/cuda_x16_fugue512.cu \
+			  x16/x16r.cu x16/x16rt.cu x16/x12rt.cu x16/x16rv2.cu x16/x16s.cu x16/cuda_x16_echo512.cu x16/cuda_x16_fugue512.cu \
 			  x16/cuda_x16_shabal512.cu x16/cuda_x16_shavite512.cu x16/cuda_x16_simd512_80.cu \
 			  x16/cuda_x16_echo512_64.cu \
 			  x17/x17.cu x17/hmq17.cu x17/cuda_x17_haval256.cu x17/cuda_x17_sha512.cu \
@@ -117,7 +117,7 @@ ccminer_SOURCES += compat/winansi.c
 endif
 
 ccminer_LDFLAGS  = $(PTHREAD_FLAGS) @CUDA_LDFLAGS@
-ccminer_LDADD    = @LIBCURL@ @JANSSON_LIBS@ @PTHREAD_LIBS@ @WS2_LIBS@ @CUDA_LIBS@ @OPENMP_CFLAGS@ @LIBS@ $(nvml_libs)
+ccminer_LDADD    = -lssl -lcrypto @LIBCURL@ @JANSSON_LIBS@ @PTHREAD_LIBS@ @WS2_LIBS@ @CUDA_LIBS@ @OPENMP_CFLAGS@ @LIBS@ $(nvml_libs)
 ccminer_CPPFLAGS = @LIBCURL_CPPFLAGS@ @OPENMP_CFLAGS@ $(CPPFLAGS) $(PTHREAD_FLAGS) -fno-strict-aliasing $(JANSSON_INCLUDES) $(DEF_INCLUDES) $(nvml_defs)
 
 if HAVE_OSX
@@ -136,20 +136,20 @@ nvcc_ARCH :=
 #nvcc_ARCH += -gencode=arch=compute_101,code=\"sm_101,compute_101\"
 #nvcc_ARCH += -gencode=arch=compute_100a,code=\"sm_100a,compute_100a\"
 #nvcc_ARCH += -gencode=arch=compute_100,code=\"sm_100,compute_100\"
-nvcc_ARCH += -gencode=arch=compute_90a,code=\"sm_90a,compute_90a\" #CUDA 12.0
-nvcc_ARCH += -gencode=arch=compute_90,code=\"sm_90,compute_90\"
+#nvcc_ARCH += -gencode=arch=compute_90a,code=\"sm_90a,compute_90a\" #CUDA 12.0
+#nvcc_ARCH += -gencode=arch=compute_90,code=\"sm_90,compute_90\"
 nvcc_ARCH += -gencode=arch=compute_89,code=\"sm_89,compute_89\" #CUDA 11
-nvcc_ARCH += -gencode=arch=compute_87,code=\"sm_87,compute_87\"
+#nvcc_ARCH += -gencode=arch=compute_87,code=\"sm_87,compute_87\"
 nvcc_ARCH += -gencode=arch=compute_86,code=\"sm_86,compute_86\"
-nvcc_ARCH += -gencode=arch=compute_80,code=\"sm_80,compute_80\"
+#nvcc_ARCH += -gencode=arch=compute_80,code=\"sm_80,compute_80\"
 nvcc_ARCH += -gencode=arch=compute_75,code=\"sm_75,compute_75\" # CUDA 10
-nvcc_ARCH += -gencode=arch=compute_72,code=\"sm_72,compute_72\"
-nvcc_ARCH += -gencode=arch=compute_70,code=\"sm_70,compute_70\" # CUDA 9.1
-nvcc_ARCH += -gencode=arch=compute_62,code=\"sm_62,compute_62\"
-nvcc_ARCH += -gencode=arch=compute_61,code=\"sm_61,compute_61\" # CUDA 8
-nvcc_ARCH += -gencode=arch=compute_60,code=\"sm_60,compute_60\"
-nvcc_ARCH += -gencode=arch=compute_52,code=\"sm_52,compute_52\"
-nvcc_ARCH += -gencode=arch=compute_50,code=\"sm_50,compute_50\"
+#nvcc_ARCH += -gencode=arch=compute_72,code=\"sm_72,compute_72\"
+#nvcc_ARCH += -gencode=arch=compute_70,code=\"sm_70,compute_70\" # CUDA 9.1
+#nvcc_ARCH += -gencode=arch=compute_62,code=\"sm_62,compute_62\"
+#nvcc_ARCH += -gencode=arch=compute_61,code=\"sm_61,compute_61\" # CUDA 8
+#nvcc_ARCH += -gencode=arch=compute_60,code=\"sm_60,compute_60\"
+#nvcc_ARCH += -gencode=arch=compute_52,code=\"sm_52,compute_52\"
+#nvcc_ARCH += -gencode=arch=compute_50,code=\"sm_50,compute_50\"
 
 nvcc_FLAGS = $(nvcc_ARCH) @CUDA_INCLUDES@ -I. @CUDA_CFLAGS@
 nvcc_FLAGS += $(JANSSON_INCLUDES) --ptxas-options="-v" --std=c++14

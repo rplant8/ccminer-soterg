@@ -1,4 +1,4 @@
-AC_INIT([ccminer-kudaraidee], [1.3.0], [], [ccminer-kudaraidee], [https://github.com/kudaraidee/ccminer-kudaraidee])
+AC_INIT([ccminer-kudaraidee], [1.3.1], [], [ccminer-kudaraidee], [https://github.com/kudaraidee/ccminer-kudaraidee])
 
 AC_PREREQ([2.69])
 AC_CANONICAL_HOST
@@ -76,8 +76,8 @@ AC_CHECK_LIB([pthread], [pthread_create], PTHREAD_LIBS="-lpthread",
 ))))
 
 AC_CHECK_LIB([z],[gzopen], [], [])
-AC_CHECK_LIB([ssl],[SSL_free], [], [AC_MSG_ERROR([OpenSSL library required])])
-AC_CHECK_LIB([crypto],[EVP_DigestFinal_ex], [], [AC_MSG_ERROR([OpenSSL library required])])
+dnl AC_CHECK_LIB([ssl],[SSL_free], [], [AC_MSG_ERROR([OpenSSL library required])])
+dnl AC_CHECK_LIB([crypto],[EVP_DigestFinal_ex], [], [AC_MSG_ERROR([OpenSSL library required])])
 
 AM_CONDITIONAL([WANT_JANSSON], [test x$request_jansson = xtrue])
 AM_CONDITIONAL([HAVE_WINDOWS], [test x$have_win32 = xtrue])

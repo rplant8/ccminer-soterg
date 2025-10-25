@@ -314,6 +314,7 @@ Options:\n\
                         skein           Skein SHA2 (Skeincoin)\n\
                         skein2          Double Skein (Woodcoin)\n\
                         skunk           Skein Cube Fugue Streebog\n\
+                        soterg          Soteria\n\
                         s3              S3 (1Coin)\n\
                         timetravel      Machinecoin permuted x8\n\
                         tribus          Denarius\n\
@@ -2740,6 +2741,9 @@ static void *miner_thread(void *userdata)
                         break;
                 case ALGO_X11:
                         rc = scanhash_x11(thr_id, &work, max_nonce, &hashes_done);
+                        break;
+                case ALGO_X12R:
+                        rc = scanhash_x12r(thr_id, &work, max_nonce, &hashes_done);
                         break;
                 case ALGO_X13:
                         rc = scanhash_x13(thr_id, &work, max_nonce, &hashes_done);
